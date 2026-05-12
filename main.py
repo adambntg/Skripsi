@@ -331,27 +331,21 @@ def calculate_ball_possession(players: sv.Detections, ball: sv.Detections,
     Menentukan team_id mana yang menguasai bola berdasarkan metrik jarak yang dipilih.
     Mendukung: 'euclidean', 'manhattan', dan 'canberra'.
     """
-    # 1. Validasi awal: Jika tidak ada bola atau pemain, tidak ada possession
     if len(ball) == 0 or len(players) == 0:
         return None
     
-    # 2. Logika Penanganan Bola Ganda: Selalu ambil deteksi bola pertama (index 0)
     if len(ball) > 1:
         ball = ball[0]
 
-    # 3. Pengambilan Koordinat
-    # Koordinat pusat pemain (biasanya bagian kaki) dan pusat bola
     player_coords = players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
     ball_coords = ball.get_anchors_coordinates(sv.Position.CENTER)
 
     # 4. Perhitungan Jarak Berdasarkan Metode (Referensi: Faisal dkk., 2020)
     if method == 'euclidean':
-        # np.linalg.norm(..., axis=1) adalah cara vektor untuk sqrt(dx^2 + dy^2)
         distances = np.linalg.norm(player_coords - ball_coords, axis=1)
         threshold = 50  # Satuan cm/pixel
         
     elif method == 'manhattan':
-        # sum(|xi - yi|) - Jarak siku-siku
         distances = np.sum(np.abs(player_coords - ball_coords), axis=1)
         threshold = 70  # Nilai lebih tinggi karena sifat penjumlahannya linear
         
@@ -506,7 +500,7 @@ def run_tracking_extraction(source_video_path: str, device: str, output_csv: str
 
 
 
-def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
+def run_radar(source_video_path: str, device: str, method:str='euclidean') -> Iterator[np.ndarray]:
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
     ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
@@ -517,6 +511,8 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     count_team_0 = 0  # for pink team
     count_team_1 = 0  # for blue team
     total_possession_frames = 0
+
+    last_possession_team = None
 
     frame_generator = sv.get_video_frames_generator(
         source_path=source_video_path, stride=STRIDE)
@@ -556,27 +552,45 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         current_ball_possession_team = calculate_ball_possession(
             players=players, 
             ball=ball_detections, 
-            players_team_id=players_team_id
+            players_team_id=players_team_id,
+            method=method
         )
+        
+        if current_ball_possession_team is not None:
+            last_possession_team = current_ball_possession_team
 
         annotated_frame = frame.copy()
 
-        if current_ball_possession_team == 0:
+        if last_possession_team == 0:
             count_team_0 += 1
             total_possession_frames += 1
-        elif current_ball_possession_team == 1:
-            count_team_1 += 1
-            total_possession_frames += 1
-
-        if current_ball_possession_team == 0:
             possession_label = "POSSESSION: PINK TEAM"
             text_color = (147, 20, 255) 
-        elif current_ball_possession_team == 1:
+        elif last_possession_team == 1:
+            count_team_1 += 1
+            total_possession_frames += 1
             possession_label = "POSSESSION: BLUE TEAM"
             text_color = (255, 191, 0)
         else:
-            possession_label = "POSSESSION: LOOSE BALL"
+            possession_label = "POSSESSION: SEARCHING..."
             text_color = (255, 255, 255)
+
+        # if current_ball_possession_team == 0:
+        #     count_team_0 += 1
+        #     total_possession_frames += 1
+        # elif current_ball_possession_team == 1:
+        #     count_team_1 += 1
+        #     total_possession_frames += 1
+
+        # if current_ball_possession_team == 0:
+        #     possession_label = "POSSESSION: PINK TEAM"
+        #     text_color = (147, 20, 255) 
+        # elif current_ball_possession_team == 1:
+        #     possession_label = "POSSESSION: BLUE TEAM"
+        #     text_color = (255, 191, 0)
+        # else:
+        #     possession_label = "POSSESSION: LOOSE BALL"
+        #     text_color = (255, 255, 255)
 
        # --- percentage logic ---
         if total_possession_frames > 0:
@@ -605,7 +619,10 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
             goalkeepers_team_id.tolist() +
             [REFEREE_CLASS_ID] * len(referees)
         )
-        labels = [str(tracker_id) for tracker_id in detections.tracker_id]
+        if detections.tracker_id is not None:
+            labels = [str(tracker_id) for tracker_id in detections.tracker_id]
+        else:
+            labels = []
 
         ##annotated_frame = frame.copy()
         annotated_frame = ELLIPSE_ANNOTATOR.annotate(
@@ -630,7 +647,7 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
 
 
 
-def main(source_video_path: str, target_video_path: str, device: str, mode: Mode) -> None:
+def main(source_video_path: str, target_video_path: str, device: str, mode: Mode, method: str) -> None:
     if mode == Mode.PITCH_DETECTION:
         frame_generator = run_pitch_detection(
             source_video_path=source_video_path, device=device)
@@ -648,7 +665,7 @@ def main(source_video_path: str, target_video_path: str, device: str, mode: Mode
             source_video_path=source_video_path, device=device)
     elif mode == Mode.RADAR:
         frame_generator = run_radar(
-            source_video_path=source_video_path, device=device)
+            source_video_path=source_video_path, device=device, method=method)
     elif mode == Mode.EXTRACT:
         run_tracking_extraction(source_video_path, device, "hasil_ekstraksi.csv")
         return # Keluar dari main karena tidak ada video yang perlu di-sink
@@ -672,10 +689,14 @@ if __name__ == '__main__':
     parser.add_argument('--target_video_path', type=str, required=True)
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--mode', type=Mode, default=Mode.RADAR)
+    parser.add_argument('--method', type=str, default='euclidean', 
+                        choices=['euclidean', 'manhattan', 'canberra'],
+                        help="Metode perhitungan jarak")
     args = parser.parse_args()
     main(
         source_video_path=args.source_video_path,
         target_video_path=args.target_video_path,
         device=args.device,
-        mode=args.mode
+        mode=args.mode,
+        method=args.method
     )
