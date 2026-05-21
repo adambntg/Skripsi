@@ -500,25 +500,28 @@ def run_tracking_extraction(source_video_path: str, device: str, output_csv: str
 
 
 
-def run_radar(source_video_path: str, device: str, method:str='euclidean') -> Iterator[np.ndarray]:
+def run_radar(source_video_path: str, device: str, method: str = 'euclidean', output_csv: str = "possession_stats_radar.csv") -> Iterator[np.ndarray]:
+    """
+    Menjalankan deteksi radar dan kalkulasi possession secara real-time, 
+    serta menyimpan histori statistik ke dalam file CSV.
+    """
+    # 1. Inisialisasi Model
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
     ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
 
-    tracking_histories = [] 
+    # 2. Inisialisasi Variabel Statistik & Logging
+    possession_records = [] 
     frame_idx = 0
-
-    count_team_0 = 0  # for pink team
-    count_team_1 = 0  # for blue team
+    count_team_0 = 0  # Pink Team
+    count_team_1 = 0  # Blue Team
     total_possession_frames = 0
-
     last_possession_team = None
 
-    frame_generator = sv.get_video_frames_generator(
-        source_path=source_video_path, stride=STRIDE)
-
+    # 3. Fit Team Classifier (Proses Stride untuk Hemat Memori)
+    frame_generator_samples = sv.get_video_frames_generator(source_path=source_video_path, stride=STRIDE)
     crops = []
-    for frame in tqdm(frame_generator, desc='collecting crops'):
+    for frame in tqdm(frame_generator_samples, desc='Collecting team crops'):
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
         crops += get_crops(frame, detections[detections.class_id == PLAYER_CLASS_ID])
@@ -526,29 +529,32 @@ def run_radar(source_video_path: str, device: str, method:str='euclidean') -> It
     team_classifier = TeamClassifier(device=device)
     team_classifier.fit(crops)
 
+    # 4. Main Loop Pemrosesan Video
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+    
     for frame in frame_generator:
-        result = pitch_detection_model(frame, verbose=False)[0]
-        keypoints = sv.KeyPoints.from_ultralytics(result)
-        result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
-        detections = sv.Detections.from_ultralytics(result)
+        # Deteksi Lapangan (Keypoints)
+        result_pitch = pitch_detection_model(frame, verbose=False)[0]
+        keypoints = sv.KeyPoints.from_ultralytics(result_pitch)
+        
+        # Deteksi Pemain & Tracking
+        result_player = player_detection_model(frame, imgsz=1280, verbose=False)[0]
+        detections = sv.Detections.from_ultralytics(result_player)
         detections = tracker.update_with_detections(detections)
 
-        # players = detections[detections.class_id == PLAYER_CLASS_ID]
-        # crops = get_crops(frame, players)
-        # players_team_id = team_classifier.predict(crops)
-
-        # ball detection
+        # Deteksi Bola
         result_ball = ball_detection_model(frame, imgsz=640, verbose=False)[0]
         ball_detections = sv.Detections.from_ultralytics(result_ball)
 
-        # get player data
+        # Klasifikasi Tim Pemain
         players = detections[detections.class_id == PLAYER_CLASS_ID]
-        crops = get_crops(frame, players)
-        players_team_id = team_classifier.predict(crops)
+        if len(players) > 0:
+            players_team_id = team_classifier.predict(get_crops(frame, players))
+        else:
+            players_team_id = np.array([])
 
-        # calculate possessionn function
+        # --- LOGIKA POSSESSION (SINKRON DENGAN VIDEO) ---
         current_ball_possession_team = calculate_ball_possession(
             players=players, 
             ball=ball_detections, 
@@ -556,11 +562,11 @@ def run_radar(source_video_path: str, device: str, method:str='euclidean') -> It
             method=method
         )
         
+        # Logika Persistence (Mengingat pemilik terakhir)
         if current_ball_possession_team is not None:
             last_possession_team = current_ball_possession_team
 
-        annotated_frame = frame.copy()
-
+        # Akumulasi statistik per frame
         if last_possession_team == 0:
             count_team_0 += 1
             total_possession_frames += 1
@@ -575,75 +581,62 @@ def run_radar(source_video_path: str, device: str, method:str='euclidean') -> It
             possession_label = "POSSESSION: SEARCHING..."
             text_color = (255, 255, 255)
 
-        # if current_ball_possession_team == 0:
-        #     count_team_0 += 1
-        #     total_possession_frames += 1
-        # elif current_ball_possession_team == 1:
-        #     count_team_1 += 1
-        #     total_possession_frames += 1
+        annotated_frame = frame.copy()
 
-        # if current_ball_possession_team == 0:
-        #     possession_label = "POSSESSION: PINK TEAM"
-        #     text_color = (147, 20, 255) 
-        # elif current_ball_possession_team == 1:
-        #     possession_label = "POSSESSION: BLUE TEAM"
-        #     text_color = (255, 191, 0)
-        # else:
-        #     possession_label = "POSSESSION: LOOSE BALL"
-        #     text_color = (255, 255, 255)
-
-       # --- percentage logic ---
+        # Render Teks Persentase ke Video
         if total_possession_frames > 0:
             perc_0 = (count_team_0 / total_possession_frames) * 100
             perc_1 = (count_team_1 / total_possession_frames) * 100
             stat_text = f"PINK: {perc_0:.1f}% | BLUE: {perc_1:.1f}%"
             
-            cv2.putText(
-                annotated_frame, stat_text, (50, 110), 
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2
-            )
+            cv2.putText(annotated_frame, stat_text, (50, 110), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            
+            # SIMPAN DATA KE LIST UNTUK CSV (Forward Filling otomatis)
+            possession_records.append({
+                'frame': frame_idx,
+                'team_id': last_possession_team,
+                'pink_perc': round(perc_0, 2),
+                'blue_perc': round(perc_1, 2)
+            })
 
-        # possession real-time (y=60)
         cv2.putText(annotated_frame, possession_label, (50, 60), 
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, text_color, 3)
 
+        # Resolusi Tim Kiper & Wasit
         goalkeepers = detections[detections.class_id == GOALKEEPER_CLASS_ID]
-        goalkeepers_team_id = resolve_goalkeepers_team_id(
-            players, players_team_id, goalkeepers)
-
+        goalkeepers_team_id = resolve_goalkeepers_team_id(players, players_team_id, goalkeepers)
         referees = detections[detections.class_id == REFEREE_CLASS_ID]
 
-        detections = sv.Detections.merge([players, goalkeepers, referees])
+        # Merge semua untuk Anotasi
+        detections_all = sv.Detections.merge([players, goalkeepers, referees])
         color_lookup = np.array(
             players_team_id.tolist() +
             goalkeepers_team_id.tolist() +
             [REFEREE_CLASS_ID] * len(referees)
         )
-        if detections.tracker_id is not None:
-            labels = [str(tracker_id) for tracker_id in detections.tracker_id]
-        else:
-            labels = []
+        labels = [str(tracker_id) for tracker_id in detections_all.tracker_id] if detections_all.tracker_id is not None else []
 
-        ##annotated_frame = frame.copy()
-        annotated_frame = ELLIPSE_ANNOTATOR.annotate(
-            annotated_frame, detections, custom_color_lookup=color_lookup)
-        annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
-            annotated_frame, detections, labels,
-            custom_color_lookup=color_lookup)
+        # Gambar Anotasi ke Frame
+        annotated_frame = ELLIPSE_ANNOTATOR.annotate(annotated_frame, detections_all, custom_color_lookup=color_lookup)
+        annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(annotated_frame, detections_all, labels, custom_color_lookup=color_lookup)
 
+        # Render & Overlay Radar
         h, w, _ = frame.shape
-        radar = render_radar(detections, keypoints, color_lookup, current_ball_possession_team)
+        radar = render_radar(detections_all, keypoints, color_lookup, last_possession_team)
         radar = sv.resize_image(radar, (w // 4, h // 4))
         radar_h, radar_w, _ = radar.shape
-        rect = sv.Rect(
-            x=w // 2 - radar_w // 2,
-            y=h - radar_h,
-            width=radar_w,
-            height=radar_h
-        )
+        rect = sv.Rect(x=w // 2 - radar_w // 2, y=h - radar_h, width=radar_w, height=radar_h)
         annotated_frame = sv.draw_image(annotated_frame, radar, opacity=0.5, rect=rect)
 
+        frame_idx += 1
         yield annotated_frame
+
+    # 5. Save Statistik Final ke CSV
+    if possession_records:
+        df_stats = pd.DataFrame(possession_records)
+        df_stats.to_csv(output_csv, index=False)
+        print(f"\n[INFO] Statistik possession berhasil diekstrak ke {output_csv}")
 
 
 
